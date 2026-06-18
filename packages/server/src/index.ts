@@ -58,6 +58,7 @@ import { validationErrorHook } from './routes/openapi-defaults';
 import {
   TelegramAdapter,
   GitHubAdapter,
+  JiraAdapter,
   DiscordAdapter,
   SlackAdapter,
   SlackWorkflowBridge,
@@ -265,6 +266,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
 
   // Platform adapters (skipped in CLI serve mode or when not configured)
   let github: GitHubAdapter | null = null;
+  let jira: JiraAdapter | null = null;
   let gitea: GiteaAdapter | null = null;
   let gitlab: GitLabAdapter | null = null;
   let discord: DiscordAdapter | null = null;
@@ -280,8 +282,14 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       process.env.GITEA_URL && process.env.GITEA_TOKEN && process.env.GITEA_WEBHOOK_SECRET
     );
     const hasGitLab = Boolean(process.env.GITLAB_TOKEN && process.env.GITLAB_WEBHOOK_SECRET);
+    const hasJira = Boolean(
+      process.env.JIRA_BASE_URL &&
+      process.env.JIRA_USER &&
+      process.env.JIRA_API_TOKEN &&
+      process.env.JIRA_WEBHOOK_SECRET
+    );
 
-    if (!hasTelegram && !hasDiscord && !hasGitHub && !hasGitea && !hasGitLab) {
+    if (!hasTelegram && !hasDiscord && !hasGitHub && !hasGitea && !hasGitLab && !hasJira) {
       getLog().warn('no_platform_adapters_configured');
     }
 
@@ -299,6 +307,29 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       activePlatforms.push('GitHub');
     } else {
       getLog().info('github_adapter_skipped');
+    }
+
+    // Initialize Jira adapter (conditional)
+    if (
+      process.env.JIRA_BASE_URL &&
+      process.env.JIRA_USER &&
+      process.env.JIRA_API_TOKEN &&
+      process.env.JIRA_WEBHOOK_SECRET
+    ) {
+      const jiraBotMention =
+        process.env.JIRA_BOT_MENTION || process.env.BOT_DISPLAY_NAME || config.botName;
+      jira = new JiraAdapter(
+        process.env.JIRA_BASE_URL,
+        process.env.JIRA_USER,
+        process.env.JIRA_API_TOKEN,
+        process.env.JIRA_WEBHOOK_SECRET,
+        lockManager,
+        jiraBotMention
+      );
+      await jira.start();
+      activePlatforms.push('Jira');
+    } else {
+      getLog().info('jira_adapter_skipped');
     }
 
     // Initialize Gitea adapter (conditional)
@@ -521,6 +552,34 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       }
     });
     getLog().info('github_webhook_registered');
+  }
+
+  // Jira webhook endpoint
+  if (jira) {
+    app.post('/webhooks/jira', async c => {
+      try {
+        // Jira Cloud webhooks have no HMAC signature — authenticate via the
+        // shared secret passed as the `?secret=` query parameter.
+        const secret = c.req.query('secret');
+        if (!secret) {
+          return c.json({ error: 'Missing secret' }, 400);
+        }
+
+        const payload = await c.req.text();
+
+        // Process async (fire-and-forget for fast webhook response).
+        // handleWebhook verifies the secret internally and never throws.
+        jira.handleWebhook(payload, secret).catch((error: unknown) => {
+          getLog().error({ err: error }, 'webhook_processing_error');
+        });
+
+        return c.text('OK', 200);
+      } catch (error) {
+        getLog().error({ err: error }, 'webhook_endpoint_error');
+        return c.json({ error: 'Internal server error' }, 500);
+      }
+    });
+    getLog().info('jira_webhook_registered');
   }
 
   // Gitea webhook endpoint
