@@ -736,6 +736,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
           // pending debounced chat.update can't fire against a closed socket.
           slackBridge?.detach();
           slack?.stop();
+          jira?.stop();
           gitea?.stop();
           gitlab?.stop();
           await webAdapter.stop();
