@@ -1,29 +1,40 @@
 name: archon-fix-jira-bug-analysis
 description: |
-  Use when: User wants to FIX or RESOLVE a JIRA bug ticket using the plan-approval flow.
-  Triggers: "fix jira bug", "fix PROJ-123", "resolve jira ticket", "fix this jira bug",
-            "bugkiller PROJ-123", "investigate and plan fix for PROJ-123".
-  NOT for: Non-bug JIRA tickets (Stories, Tasks, Epics), GitHub issues,
-           questions about tickets, PR reviews, general exploration.
-           For one-shot fixes without approval, use archon-fix-jira-bug.
+  Use when: User wants to PLAN work for a JIRA ticket (Bug, Defect, Task, Story, or
+  Sub-task) and get a DRAFT PR + JIRA comment with the proposed plan for review.
+  Triggers: "plan PROJ-123", "fix jira bug", "fix PROJ-123", "plan jira ticket",
+            "investigate and plan PROJ-123", "bugkiller PROJ-123".
+  NOT for: One-shot fixes without approval (use archon-fix-jira-bug), Epics
+           (use jira-epic-slice), GitHub issues, questions about tickets, PR reviews.
 
   Requires environment variables: JIRA_BASE_URL, JIRA_USER, JIRA_API_TOKEN.
 
-  DAG workflow that:
-  1. Fetches the JIRA bug ticket and validates it is type Bug
-  2. Transitions ticket to "In Progress"
-  3. Researches context (web research + codebase exploration)
-  4. Investigates root cause
-  5. ALWAYS writes a fix plan to .bugkiller-state/<KEY>/plan.md
-  6. Posts the plan to JIRA with approval instructions
-  7. Exits — run archon-fix-jira-bug-implementation after human approves the plan
+  DAG workflow that handles BOTH bugs and feature work, branching on issue type:
+
+  Bug / Defect:
+  1. Fetch the ticket, classify it, transition to "In Progress"
+  2. Research context (web research + codebase exploration)
+  3. Investigate the root cause
+  4. Write a fix plan (root cause + chosen fix + why it's the best option)
+  5. Commit the plan to docs/plans/<KEY>.md and open a DRAFT PR
+  6. Post the plan to JIRA and link the PR — exits before implementation
+
+  Task / Story / Sub-task (anything not Bug/Defect):
+  1. Fetch the ticket, classify it, transition to "In Progress"
+  2. Research context (web research)
+  3. BRAINSTORM interactively with the user until they approve the design (99% sure)
+  4. Write an implementation plan from the agreed design
+  5. Commit the plan to docs/plans/<KEY>.md and open a DRAFT PR
+  6. Post the plan to JIRA and link the PR — exits before implementation
 
 provider: claude
 model: sonnet
+# Required for the interactive brainstorming gate on web/Slack (foreground execution).
+interactive: true
 
 nodes:
   # ═══════════════════════════════════════════════════════════════
-  # PHASE 1: FETCH & VALIDATE
+  # PHASE 1: FETCH & CLASSIFY
   # ═══════════════════════════════════════════════════════════════
 
   - id: extract-issue-key
@@ -65,8 +76,14 @@ nodes:
       echo "$BODY"
     depends_on: [extract-issue-key]
 
-  # Validates issue type is Bug, saves key, transitions to In Progress.
-  - id: validate-and-start
+  # Classifies the issue, saves the key + category, and transitions to In Progress.
+  # Unlike the old bug-only gate, this NEVER hard-fails on type: Bug/Defect route to
+  # the root-cause branch, everything else (Task/Story/Sub-task/...) routes to the
+  # interactive brainstorming branch.
+  #
+  # stdout MUST be the bare category (BUG|TASK) so downstream `when:` conditions can
+  # match it exactly — all human-readable output goes to stderr.
+  - id: classify-and-start
     bash: |
       KEY=$(echo "$extract-issue-key.output" | tr -d ' \n\t' | grep -oE '[A-Z]+-[0-9]+' | head -1)
       echo "$KEY" > "$ARTIFACTS_DIR/.jira-key"
@@ -74,13 +91,15 @@ nodes:
       ISSUE_TYPE=$(jq -r '.fields.issuetype.name' "$ARTIFACTS_DIR/jira-issue.json")
       NORMALIZED=$(echo "$ISSUE_TYPE" | tr '[:upper:]' '[:lower:]')
 
-      if ! echo "$NORMALIZED" | grep -qE '^(bug|defect)$'; then
-        echo "Ticket $KEY is type '$ISSUE_TYPE' — this workflow only handles Bug tickets." >&2
-        exit 1
+      if echo "$NORMALIZED" | grep -qE '^(bug|defect)$'; then
+        CATEGORY="BUG"
+      else
+        CATEGORY="TASK"
       fi
+      echo "$CATEGORY" > "$ARTIFACTS_DIR/.issue-category"
 
       SUMMARY=$(jq -r '.fields.summary' "$ARTIFACTS_DIR/jira-issue.json")
-      echo "Confirmed Bug: [$KEY] $SUMMARY"
+      echo "Classified [$KEY] type '$ISSUE_TYPE' as $CATEGORY: $SUMMARY" >&2
 
       # Transition to In Progress (best-effort)
       TRANSITIONS=$(curl -s \
@@ -97,10 +116,13 @@ nodes:
           "$JIRA_BASE_URL/rest/api/3/issue/$KEY/transitions" \
           -H "Content-Type: application/json" \
           -d "{\"transition\": {\"id\": \"$TRANSITION_ID\"}}" > /dev/null
-        echo "Transitioned $KEY to In Progress"
+        echo "Transitioned $KEY to In Progress" >&2
       else
-        echo "No 'In Progress' transition available — skipping status change"
+        echo "No 'In Progress' transition available — skipping status change" >&2
       fi
+
+      # Bare category is the only stdout — consumed by downstream `when:` conditions.
+      echo "$CATEGORY"
     depends_on: [fetch-jira-issue]
 
   # Persist initial state to .bugkiller-state/<KEY>/ so revision and implementation
@@ -112,8 +134,9 @@ nodes:
       mkdir -p "$STATE_DIR/plan-history"
       cp "$ARTIFACTS_DIR/jira-issue.json" "$STATE_DIR/jira-issue.json"
       echo "$KEY" > "$STATE_DIR/.jira-key"
+      cp "$ARTIFACTS_DIR/.issue-category" "$STATE_DIR/.issue-category"
       echo "Initialized $STATE_DIR"
-    depends_on: [validate-and-start]
+    depends_on: [classify-and-start]
 
   - id: notify-taking-over
     bash: |
@@ -128,7 +151,7 @@ nodes:
               content: [
                 {
                   type: "text",
-                  text: "🤖 BugKiller has picked up this ticket and is now investigating the root cause. A fix plan will be posted for your approval shortly."
+                  text: "🤖 Archon has picked up this ticket and is researching it now. A proposed plan and a draft PR will follow for your review."
                 }
               ]
             }
@@ -144,42 +167,164 @@ nodes:
     depends_on: [persist-state-init]
 
   # ═══════════════════════════════════════════════════════════════
-  # PHASE 2: RESEARCH
+  # PHASE 2: RESEARCH (both branches)
   # ═══════════════════════════════════════════════════════════════
 
   - id: web-research
     command: archon-web-research
-    depends_on: [validate-and-start]
+    depends_on: [classify-and-start]
     context: fresh
 
   # ═══════════════════════════════════════════════════════════════
-  # PHASE 3: INVESTIGATE
+  # BUG BRANCH — investigate root cause, then write a fix plan
   # ═══════════════════════════════════════════════════════════════
 
   - id: investigate
     command: jira-investigate-issue
-    depends_on: [validate-and-start, web-research]
+    depends_on: [classify-and-start, web-research]
+    when: "$classify-and-start.output == 'BUG'"
     context: fresh
 
-  # Persist investigation.md to state for downstream workflows.
   - id: persist-investigation
     bash: |
       KEY=$(cat "$ARTIFACTS_DIR/.jira-key")
       cp "$ARTIFACTS_DIR/investigation.md" ".bugkiller-state/$KEY/investigation.md"
       echo "Persisted investigation.md for $KEY"
     depends_on: [investigate]
+    when: "$classify-and-start.output == 'BUG'"
 
-  # ═══════════════════════════════════════════════════════════════
-  # PHASE 3.5: ALWAYS PRODUCE A PLAN (no confidence gate)
-  # ═══════════════════════════════════════════════════════════════
-
-  - id: produce-plan
+  # Writes $ARTIFACTS_DIR/plan.md (root cause + chosen fix + why it's best).
+  - id: produce-plan-bug
     command: archon-bug-plan
     depends_on: [persist-investigation]
+    when: "$classify-and-start.output == 'BUG'"
     context: fresh
 
-  # Persist plan.md to state. Archive any prior plan first (matters for revision flow).
+  # ═══════════════════════════════════════════════════════════════
+  # TASK BRANCH — brainstorm with the user, then write an implementation plan
+  # ═══════════════════════════════════════════════════════════════
+
+  # Interactive brainstorming. Loops, pausing for the user after each turn, until
+  # they explicitly approve the design. Mirrors the brainstorming skill's method
+  # inline (no external skill dependency): explore → one question at a time →
+  # propose approaches → present a design → refine → approval.
+  - id: brainstorm
+    depends_on: [classify-and-start, web-research]
+    when: "$classify-and-start.output == 'TASK'"
+    loop:
+      max_iterations: 15
+      until: DESIGN_APPROVED
+      interactive: true
+      gate_message: "Reply with answers/feedback to refine the design, or say \"approved\" (or \"looks good\"/\"ship it\") once you're happy with it. Only an explicit approval ends the brainstorm."
+      prompt: |
+        # Brainstorming an implementation plan for a JIRA ticket
+
+        You are a senior engineering partner turning a JIRA ticket into a fully-formed,
+        agreed design BEFORE any implementation. Work collaboratively — do NOT write code.
+
+        **JIRA ticket**: read it at `$ARTIFACTS_DIR/jira-issue.json`
+        ```bash
+        KEY=$(cat "$ARTIFACTS_DIR/.jira-key")
+        jq -r '"[" + .key + "] " + .fields.summary + "\n\n" + (.fields.description // "")' "$ARTIFACTS_DIR/jira-issue.json" 2>/dev/null || cat "$ARTIFACTS_DIR/jira-issue.json"
+        ```
+        **Web research already gathered**:
+        $web-research.output
+
+        **User's latest message**: $LOOP_USER_INPUT
+
+        ---
+
+        ## If this is the FIRST iteration ($LOOP_USER_INPUT is empty):
+
+        1. **Explore the codebase** — read CLAUDE.md/conventions, find related existing
+           code, read the key files, check recent git history. Do your homework before asking.
+        2. **Present your understanding** of what the ticket asks for (2-3 sentences) and
+           **what already exists** that's relevant (cite `file:line`).
+        3. **Propose 2-3 approaches** with trade-offs and a clear recommendation.
+        4. **Ask the SINGLE most important clarifying question** — one question at a time.
+           Do NOT dump a list. Prefer extending what exists over building anew.
+
+        ## On LATER iterations (user has replied):
+
+        - Incorporate their answer. Ask the next single most important question, OR — once
+          the picture is clear — **present the design** in sections:
+          objective, approach, affected files, step-by-step tasks, acceptance criteria,
+          risks/open questions. Then ask: "Does this look right, or should I adjust anything?"
+        - Keep refining until the user is confident.
+
+        ## Approval
+
+        ONLY when the user's latest message EXPLICITLY approves (e.g. "approved",
+        "looks good", "ship it", "go ahead", "perfect"), end the brainstorm:
+        - Output a concise final **agreed design** (the sections above), then on its own
+          final line output exactly: DESIGN_APPROVED
+        - Questions, requests for changes, or partial answers are NOT approval — keep looping.
+
+        NEVER output DESIGN_APPROVED until the user has explicitly approved.
+
+  # Turns the approved design into the canonical $ARTIFACTS_DIR/plan.md.
+  - id: produce-plan-task
+    depends_on: [brainstorm]
+    when: "$classify-and-start.output == 'TASK'"
+    context: fresh
+    prompt: |
+      Write a clean, actionable implementation plan to `$ARTIFACTS_DIR/plan.md` based on
+      the design the user just approved during brainstorming.
+
+      **JIRA key**:
+      ```bash
+      JIRA_KEY=$(cat "$ARTIFACTS_DIR/.jira-key")
+      ```
+
+      **Agreed design (from brainstorming)**:
+      $brainstorm.output
+
+      Write `$ARTIFACTS_DIR/plan.md` using EXACTLY this structure (a standalone
+      current-state document — no conversation history):
+
+      ```markdown
+      # Implementation Plan: <JIRA_KEY>
+
+      ## Objective
+      <one sentence describing what this delivers>
+
+      ## Affected Files
+      - `<repo-relative path>` — <why this file is touched>
+
+      ### New Files (only if any are required)
+      - `<repo-relative path>` — <purpose>
+
+      ## Step-by-step Tasks
+      Numbered tasks in execution order, each concrete enough to implement without
+      re-deriving intent.
+
+      ### 1. <Task name>
+      - <specific action>
+
+      ## Acceptance Criteria
+      - <measurable criterion>
+
+      ## Validation Commands
+      - `<command>` — <what it proves>
+
+      ## Risks & Notes
+      <edge cases, dependencies, deliberately deferred behavior>
+      ```
+
+      Verify before exiting:
+      ```bash
+      test -s "$ARTIFACTS_DIR/plan.md" && echo "Plan written ($(wc -l < "$ARTIFACTS_DIR/plan.md") lines)" \
+        || { echo "FATAL: plan.md is missing or empty" >&2; exit 1; }
+      ```
+
+  # ═══════════════════════════════════════════════════════════════
+  # CONVERGE: persist plan → draft PR → JIRA comment + PR link
+  # Both branches write the same $ARTIFACTS_DIR/plan.md, so the tail is type-agnostic.
+  # ═══════════════════════════════════════════════════════════════
+
   - id: persist-plan
+    depends_on: [produce-plan-bug, produce-plan-task]
+    trigger_rule: one_success
     bash: |
       set -euo pipefail
       KEY=$(cat "$ARTIFACTS_DIR/.jira-key")
@@ -197,13 +342,90 @@ nodes:
       done
 
       echo "Persisted plan.md for $KEY"
-    depends_on: [produce-plan]
 
-  # ═══════════════════════════════════════════════════════════════
-  # PHASE 4: POST PLAN TO JIRA (awaits human approval)
-  # ═══════════════════════════════════════════════════════════════
+  # Commit the plan to docs/plans/<KEY>.md and open a DRAFT PR with the plan summary.
+  # This is a PLAN proposal PR — no source changes; implementation follows after approval.
+  - id: create-draft-pr
+    depends_on: [persist-plan]
+    context: fresh
+    prompt: |
+      Open a DRAFT pull request that carries the proposed plan for this JIRA ticket.
+      This is a PLAN proposal — do NOT implement the fix/feature or modify source code.
 
+      ## Step 1 — Context
+      ```bash
+      JIRA_KEY=$(cat "$ARTIFACTS_DIR/.jira-key")
+      CATEGORY=$(cat "$ARTIFACTS_DIR/.issue-category")
+      echo "Ticket: $JIRA_KEY ($CATEGORY)"
+      echo "URL: $JIRA_BASE_URL/browse/$JIRA_KEY"
+      ```
+
+      ## Step 2 — Commit the plan document (and ONLY that)
+      ```bash
+      JIRA_KEY=$(cat "$ARTIFACTS_DIR/.jira-key")
+      mkdir -p docs/plans
+      cp "$ARTIFACTS_DIR/plan.md" "docs/plans/$JIRA_KEY.md"
+      git add "docs/plans/$JIRA_KEY.md"
+      # Never `git add -A`/`.`/`-u`. Verify nothing else is staged:
+      git status --porcelain
+      git commit -m "[$JIRA_KEY] Add proposed plan (docs/plans/$JIRA_KEY.md)"
+      git push -u origin HEAD
+      ```
+
+      ## Step 3 — Create the draft PR
+      1. Look for a PR template at `.github/pull_request_template.md`,
+         `.github/PULL_REQUEST_TEMPLATE.md`, or `docs/PULL_REQUEST_TEMPLATE.md`.
+      2. Check for an existing PR on this branch: `gh pr list --head "$(git branch --show-current)"`.
+         If one exists, reuse it (capture its number) instead of creating a new one.
+      3. Create a DRAFT PR: `gh pr create --draft --base "$BASE_BRANCH"`
+         - Title: `[<JIRA_KEY>] Plan: <short ticket summary>` (imperative, under 70 chars).
+         - Body (write the file to `$ARTIFACTS_DIR/pr-body.md` or `/tmp/` — NEVER inside the worktree):
+           - First line: `**JIRA**: [<JIRA_KEY>](<JIRA_BASE_URL>/browse/<JIRA_KEY>)`
+           - A note: "📋 This is a **plan proposal** (see `docs/plans/<JIRA_KEY>.md`). No
+             implementation yet — review the plan; implementation follows after approval."
+           - For a **Bug/Defect**: summarize the root cause, the chosen fix, and why it's the
+             best option (pull from `docs/plans/<JIRA_KEY>.md`).
+           - For a **Task/Story/Sub-task**: summarize the agreed approach and the step-by-step plan.
+           - If a PR template exists, fill in every section; replace any `Fixes #...` with
+             `Refs <JIRA_KEY>` (JIRA and GitHub are separate systems).
+
+      ## Step 4 — Capture PR identifiers
+      ```bash
+      PR_NUMBER=$(gh pr view --json number -q '.number')
+      echo "$PR_NUMBER" > "$ARTIFACTS_DIR/.pr-number"
+      PR_URL=$(gh pr view --json url -q '.url')
+      echo "$PR_URL" > "$ARTIFACTS_DIR/.pr-url"
+      echo "Draft PR #$PR_NUMBER: $PR_URL"
+      ```
+
+  # Post the plan to JIRA as a comment (with approval footer).
   - id: post-plan
     command: archon-bug-post-plan
     depends_on: [persist-plan]
     context: fresh
+
+  # Link the draft PR back to the JIRA ticket (remote link) for bidirectional
+  # traceability. Best-effort — continues if the link API is unavailable.
+  - id: link-pr-to-jira
+    depends_on: [create-draft-pr]
+    bash: |
+      KEY=$(cat "$ARTIFACTS_DIR/.jira-key")
+      PR_URL=$(cat "$ARTIFACTS_DIR/.pr-url" 2>/dev/null || echo "")
+      PR_NUMBER=$(cat "$ARTIFACTS_DIR/.pr-number" 2>/dev/null || echo "")
+
+      if [ -n "$PR_URL" ] && [ -n "$PR_NUMBER" ]; then
+        REMOTE_LINK_BODY=$(jq -n \
+          --arg url "$PR_URL" \
+          --arg title "PR #$PR_NUMBER (plan)" \
+          '{object: {url: $url, title: $title, icon: {url16x16: "https://github.com/favicon.ico", title: "GitHub PR"}}}')
+
+        curl -s -X POST \
+          -u "$JIRA_USER:$JIRA_API_TOKEN" \
+          "$JIRA_BASE_URL/rest/api/3/issue/$KEY/remotelink" \
+          -H "Content-Type: application/json" \
+          -d "$REMOTE_LINK_BODY" > /dev/null
+
+        echo "Linked PR #$PR_NUMBER to $KEY in JIRA"
+      else
+        echo "PR info not found — skipping JIRA remote link"
+      fi
