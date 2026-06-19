@@ -407,6 +407,20 @@ export class SqliteAdapter implements IDatabase {
         UNIQUE(user_id, provider)
       );
 
+      -- Per-user AI preferences (Phase 3): personal model tiers/aliases (JSON-as-TEXT)
+      -- + default_provider. NON-encrypted (model names aren't secrets). One row per
+      -- user; folded into buildAiProfile as the highest-precedence layer.
+      CREATE TABLE IF NOT EXISTS remote_agent_user_ai_prefs (
+        id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+        user_id TEXT NOT NULL REFERENCES remote_agent_users(id) ON DELETE CASCADE,
+        tiers TEXT,
+        aliases TEXT,
+        default_provider TEXT,
+        created_at TEXT DEFAULT (datetime('now')),
+        updated_at TEXT DEFAULT (datetime('now')),
+        UNIQUE(user_id)
+      );
+
       -- Codebases table
       CREATE TABLE IF NOT EXISTS remote_agent_codebases (
         id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
