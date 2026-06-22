@@ -1165,32 +1165,39 @@ ${userComment}`;
       finalMessage = strippedComment.split('\n')[0].trim();
       getLog().debug({ command: finalMessage }, 'github.slash_command_processing');
 
-      // Add issue/PR reference context
-      if (eventType === 'issue' && issue) {
-        contextToAppend = `GitHub Issue #${String(issue.number)}: "${issue.title}"\nUse 'gh issue view ${String(issue.number)}' for full details if needed.`;
+      // Add issue/PR reference context. For issue_comment events on PRs, GitHub
+      // puts the PR indicator in event.issue.pull_request (not a top-level
+      // event.pull_request), so we use the isPR flag rather than pullRequest.
+      if (isPR && issue) {
+        contextToAppend = `GitHub Pull Request #${String(issue.number)}: "${issue.title}"\nUse 'gh pr view ${String(issue.number)}' for full details if needed.`;
       } else if (eventType === 'pull_request' && pullRequest) {
         contextToAppend = `GitHub Pull Request #${String(pullRequest.number)}: "${pullRequest.title}"\nUse 'gh pr view ${String(pullRequest.number)}' for full details if needed.`;
-      } else if (eventType === 'issue_comment') {
-        if (pullRequest) {
-          contextToAppend = `GitHub Pull Request #${String(pullRequest.number)}: "${pullRequest.title}"\nUse 'gh pr view ${String(pullRequest.number)}' for full details if needed.`;
-        } else if (issue) {
-          contextToAppend = `GitHub Issue #${String(issue.number)}: "${issue.title}"\nUse 'gh issue view ${String(issue.number)}' for full details if needed.`;
-        }
+      } else if (issue) {
+        contextToAppend = `GitHub Issue #${String(issue.number)}: "${issue.title}"\nUse 'gh issue view ${String(issue.number)}' for full details if needed.`;
       }
     } else {
-      // For non-command messages, add rich context and issue/PR reference for workflows
-      if (eventType === 'issue' && issue) {
-        finalMessage = this.buildIssueContext(issue, strippedComment);
-        contextToAppend = `GitHub Issue #${String(issue.number)}: "${issue.title}"\nUse 'gh issue view ${String(issue.number)}' for full details if needed.`;
-      } else if (eventType === 'issue_comment' && issue) {
-        finalMessage = this.buildIssueContext(issue, strippedComment);
-        contextToAppend = `GitHub Issue #${String(issue.number)}: "${issue.title}"\nUse 'gh issue view ${String(issue.number)}' for full details if needed.`;
+      // For non-command messages, add rich context and issue/PR reference for workflows.
+      // GitHub's issue_comment events on PRs set event.issue.pull_request (not a top-level
+      // event.pull_request), so pullRequest is undefined for those events. Use isPR instead.
+      if (isPR && issue) {
+        // issue data doubles as the PR representation for issue_comment events
+        finalMessage = this.buildPRContext(
+          {
+            number: issue.number,
+            title: issue.title,
+            body: issue.body,
+            user: issue.user,
+            state: issue.state,
+          },
+          strippedComment
+        );
+        contextToAppend = `GitHub Pull Request #${String(issue.number)}: "${issue.title}"\nUse 'gh pr view ${String(issue.number)}' for full details if needed.`;
       } else if (eventType === 'pull_request' && pullRequest) {
         finalMessage = this.buildPRContext(pullRequest, strippedComment);
         contextToAppend = `GitHub Pull Request #${String(pullRequest.number)}: "${pullRequest.title}"\nUse 'gh pr view ${String(pullRequest.number)}' for full details if needed.`;
-      } else if (eventType === 'issue_comment' && pullRequest) {
-        finalMessage = this.buildPRContext(pullRequest, strippedComment);
-        contextToAppend = `GitHub Pull Request #${String(pullRequest.number)}: "${pullRequest.title}"\nUse 'gh pr view ${String(pullRequest.number)}' for full details if needed.`;
+      } else if (issue) {
+        finalMessage = this.buildIssueContext(issue, strippedComment);
+        contextToAppend = `GitHub Issue #${String(issue.number)}: "${issue.title}"\nUse 'gh issue view ${String(issue.number)}' for full details if needed.`;
       }
     }
 

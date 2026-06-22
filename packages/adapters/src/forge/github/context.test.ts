@@ -301,8 +301,11 @@ describe('GitHubAdapter non-slash command context passing', () => {
 
     expect(mockHandleMessage).toHaveBeenCalledTimes(1);
     const contextArg = mockHandleMessage.mock.calls[0][3]?.issueContext as string;
+    // issue_comment events on PRs carry the PR indicator in event.issue.pull_request
+    // (no top-level event.pull_request), so the adapter keys off the isPR flag and
+    // labels the context as a Pull Request with `gh pr view`.
     expect(contextArg).toBe(
-      'GitHub Issue #55: "Add dark mode"\nUse \'gh issue view 55\' for full details if needed.'
+      'GitHub Pull Request #55: "Add dark mode"\nUse \'gh pr view 55\' for full details if needed.'
     );
   });
 

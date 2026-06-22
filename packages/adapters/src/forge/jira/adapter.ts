@@ -350,7 +350,8 @@ ${description}`;
   // ── Webhook entry point ───────────────────────────────────────────────────
 
   /**
-   * Handle an incoming Jira webhook. `secret` is the `?secret=` query param.
+   * Handle an incoming Jira webhook. `secret` is the bearer token extracted from
+   * the request's `Authorization: Bearer <secret>` header.
    * Fire-and-forget contract: all failures are logged, never thrown to caller.
    */
   async handleWebhook(payload: string, secret: string | undefined): Promise<void> {
@@ -371,7 +372,10 @@ ${description}`;
       return;
     }
 
-    if (event.webhookEvent !== 'comment_created') {
+    // If webhookEvent is absent but a comment is present (e.g. custom/automation
+    // webhooks that omit the field), treat it as comment_created.
+    const effectiveEvent = event.webhookEvent ?? (event.comment ? 'comment_created' : undefined);
+    if (effectiveEvent !== 'comment_created') {
       getLog().debug({ webhookEvent: event.webhookEvent }, 'jira.event_ignored');
       return;
     }

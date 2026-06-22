@@ -23,9 +23,20 @@ nodes:
 
   - id: extract-pr-number
     bash: |
-      PR=$(echo "$ARGUMENTS" | grep -oE '[0-9]+' | head -1)
+      # 1) Explicit PR number passed as an argument wins
+      #    (e.g. "/workflow run pr-address-review 42")
+      PR=$(printf '%s' "$ARGUMENTS" | grep -oE '[0-9]+' | head -1)
+
+      # 2) Fall back to the GitHub PR context, populated when the workflow is
+      #    triggered from a PR comment (e.g. "@archon /workflow run pr-address-review"
+      #    with no number). The context leads with a "... #<number>:" reference
+      #    (e.g. "GitHub Pull Request #42:"), so take the first #<number>.
       if [ -z "$PR" ]; then
-        echo "No PR number found in: $ARGUMENTS" >&2
+        PR=$(printf '%s' "$ISSUE_CONTEXT" | grep -oE '#[0-9]+' | grep -oE '[0-9]+' | head -1)
+      fi
+
+      if [ -z "$PR" ]; then
+        echo "No PR number found. Pass one explicitly (e.g. 'pr-address-review 42') or run from a GitHub PR comment." >&2
         exit 1
       fi
       echo "$PR"

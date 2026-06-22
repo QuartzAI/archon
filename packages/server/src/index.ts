@@ -829,11 +829,14 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   if (jira) {
     app.post('/webhooks/jira', async c => {
       try {
-        // Jira Cloud webhooks have no HMAC signature — authenticate via the
-        // shared secret passed as the `?secret=` query parameter.
-        const secret = c.req.query('secret');
+        // Jira Cloud webhooks have no HMAC signature — authenticate via a shared
+        // secret presented as an `Authorization: Bearer <secret>` header.
+        const authHeader = c.req.header('Authorization');
+        const secret = authHeader?.startsWith('Bearer ')
+          ? authHeader.slice('Bearer '.length).trim()
+          : undefined;
         if (!secret) {
-          return c.json({ error: 'Missing secret' }, 400);
+          return c.json({ error: 'Missing or malformed Authorization header' }, 401);
         }
 
         const payload = await c.req.text();
