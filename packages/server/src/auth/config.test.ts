@@ -6,8 +6,12 @@ import {
   isEmailAllowed,
   getSignupMode,
   isApiGateEnabled,
+  isHeaderAuthEnabled,
+  isIapJwtEnabled,
   isArchonOwnedAuthPath,
 } from './config';
+
+const IAP_AUD = '/projects/123/global/backendServices/456';
 
 const VALID_SECRET = 'a'.repeat(32);
 const PG_URL = 'postgresql://postgres:postgres@localhost:5432/db';
@@ -98,6 +102,28 @@ describe('auth/config', () => {
     });
   });
 
+  describe('isHeaderAuthEnabled', () => {
+    test('true when ARCHON_WEB_AUTH_HEADER is set (IAP / forward-auth posture)', () => {
+      expect(
+        isHeaderAuthEnabled({ ARCHON_WEB_AUTH_HEADER: 'X-Goog-Authenticated-User-Email' })
+      ).toBe(true);
+    });
+
+    test('false when unset (solo/local install)', () => {
+      expect(isHeaderAuthEnabled({})).toBe(false);
+    });
+  });
+
+  describe('isIapJwtEnabled', () => {
+    test('true when ARCHON_IAP_JWT_AUDIENCE is set', () => {
+      expect(isIapJwtEnabled({ ARCHON_IAP_JWT_AUDIENCE: IAP_AUD })).toBe(true);
+    });
+
+    test('false when unset', () => {
+      expect(isIapJwtEnabled({})).toBe(false);
+    });
+  });
+
   describe('isApiGateEnabled', () => {
     test('true when web auth is enabled and not opted out (default)', () => {
       expect(isApiGateEnabled({ DATABASE_URL: PG_URL, BETTER_AUTH_SECRET: VALID_SECRET })).toBe(
@@ -105,8 +131,33 @@ describe('auth/config', () => {
       );
     });
 
-    test('false when web auth is disabled', () => {
+    test('true in plaintext-header mode WITHOUT Better Auth', () => {
+      expect(isApiGateEnabled({ ARCHON_WEB_AUTH_HEADER: 'X-Goog-Authenticated-User-Email' })).toBe(
+        true
+      );
+    });
+
+    test('true in IAP JWT mode WITHOUT Better Auth or plaintext header', () => {
+      expect(isApiGateEnabled({ ARCHON_IAP_JWT_AUDIENCE: IAP_AUD })).toBe(true);
+    });
+
+    test('false when no auth mode is configured (solo unchanged)', () => {
       expect(isApiGateEnabled({})).toBe(false);
+    });
+
+    test('false when IAP JWT mode is explicitly opted out', () => {
+      expect(
+        isApiGateEnabled({ ARCHON_IAP_JWT_AUDIENCE: IAP_AUD, ARCHON_WEB_AUTH_REQUIRED: 'false' })
+      ).toBe(false);
+    });
+
+    test('false when header-only mode is explicitly opted out', () => {
+      expect(
+        isApiGateEnabled({
+          ARCHON_WEB_AUTH_HEADER: 'X-Goog-Authenticated-User-Email',
+          ARCHON_WEB_AUTH_REQUIRED: 'false',
+        })
+      ).toBe(false);
     });
 
     test('false when explicitly opted out via ARCHON_WEB_AUTH_REQUIRED=false', () => {

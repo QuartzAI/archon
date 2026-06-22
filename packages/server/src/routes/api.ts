@@ -103,7 +103,15 @@ import * as workflowEventDb from '@archon/core/db/workflow-events';
 import * as messageDb from '@archon/core/db/messages';
 import * as userDb from '@archon/core/db/users';
 import { resetWorkflowNodeSessions } from '@archon/core/operations/workflow-operations';
-import { getAuth, isWebAuthEnabled, getSignupMode, isApiGateEnabled } from '../auth';
+import {
+  getAuth,
+  isWebAuthEnabled,
+  getSignupMode,
+  isApiGateEnabled,
+  normalizeProxyIdentity,
+  verifyIapAssertion,
+  IAP_ASSERTION_HEADER,
+} from '../auth';
 import { errorSchema } from './schemas/common.schemas';
 import { updateCheckResponseSchema } from './schemas/system.schemas';
 import {
@@ -1371,20 +1379,56 @@ export function registerApiRoutes(
   });
 
   /**
+   * Resolve the identity supplied by the upstream proxy/IAP, or undefined.
+   *
+   * Two mutually-exclusive modes, strong first:
+   *   - IAP JWT (ARCHON_IAP_JWT_AUDIENCE set): verify the Google-signed
+   *     `X-Goog-IAP-JWT-Assertion` against IAP's public keys + audience. The
+   *     plaintext `ARCHON_WEB_AUTH_HEADER` is NOT consulted in this mode, so a
+   *     client reaching the backend directly cannot forge an identity by setting
+   *     a header. A missing/invalid assertion → undefined (fail closed).
+   *   - Plaintext header (ARCHON_WEB_AUTH_HEADER set, no JWT audience): trust the
+   *     header value, stripping IAP's `accounts.google.com:` namespace prefix.
+   *     Only as strong as the network boundary (forgeable past the LB).
+   */
+  async function resolveProxyIdentity(c: Context): Promise<string | undefined> {
+    const jwtAudience = process.env.ARCHON_IAP_JWT_AUDIENCE?.trim();
+    if (jwtAudience) {
+      const assertion = c.req.header(IAP_ASSERTION_HEADER)?.trim();
+      if (!assertion) return undefined;
+      try {
+        const identity = await verifyIapAssertion(assertion, jwtAudience);
+        return identity.email;
+      } catch (err) {
+        // Invalid signature / wrong audience / expired / missing email / JWKS
+        // fetch failure → fail closed (no trusted identity). warn, don't throw.
+        getLog().warn({ err: err as Error, path: c.req.path }, 'web.iap_jwt_verify_failed');
+        return undefined;
+      }
+    }
+    const headerName = process.env.ARCHON_WEB_AUTH_HEADER || 'X-Archon-User';
+    const raw = c.req.header(headerName)?.trim();
+    if (!raw) return undefined;
+    // IAP sends `accounts.google.com:<email>`; canonicalize to the bare subject.
+    return normalizeProxyIdentity(raw);
+  }
+
+  /**
    * Resolve the per-request auth context: `{ userId, role }`, or undefined when
    * no identity is present. This is the single chokepoint generalised from the
    * old header-only seam. Resolution order:
    *   1. Better Auth session (when web auth is enabled) → canonical
    *      remote_agent_users row via the 'web' platform identity.
-   *   2. Trusted reverse-proxy header (ARCHON_WEB_AUTH_HEADER, default
-   *      `X-Archon-User`) — kept for proxy deploys and the auth-service sidecar.
+   *   2. Trusted proxy identity (IAP JWT, else plaintext header) via
+   *      `resolveProxyIdentity` — kept for proxy/IAP deploys and the sidecar.
    *   3. undefined → NULL attribution, never elevated.
    *
    * `role` rides along on the canonical user row (defaults 'admin'); it is the
    * durable seam future per-resource scoping hooks into. Visibility stays open.
    *
-   * SECURITY: header trust is only safe when Archon is reachable solely through
-   * a reverse proxy (bind 127.0.0.1). The server logs a startup warning otherwise.
+   * SECURITY: plaintext header trust is only safe when Archon is reachable solely
+   * through a reverse proxy (bind 127.0.0.1 / firewalled to the LB). IAP JWT mode
+   * removes that dependency. The server logs a startup warning otherwise.
    */
   async function resolveAuthContext(
     c: Context
@@ -1413,12 +1457,11 @@ export function registerApiRoutes(
       }
     }
 
-    // 2. Trusted reverse-proxy header.
-    const headerName = process.env.ARCHON_WEB_AUTH_HEADER || 'X-Archon-User';
-    const headerVal = c.req.header(headerName)?.trim();
-    if (!headerVal) return undefined;
+    // 2. Trusted proxy identity (IAP JWT, else plaintext header).
+    const identity = await resolveProxyIdentity(c);
+    if (!identity) return undefined;
     try {
-      const user = await userDb.findOrCreateUserByPlatformIdentity('web', headerVal, headerVal);
+      const user = await userDb.findOrCreateUserByPlatformIdentity('web', identity, identity);
       return { userId: user.id, role: user.role };
     } catch (err) {
       // Best-effort attribution: the header WAS present, but identity resolution
@@ -1473,12 +1516,11 @@ export function registerApiRoutes(
       }
     }
 
-    // 2. Trusted reverse-proxy header.
-    const headerName = process.env.ARCHON_WEB_AUTH_HEADER || 'X-Archon-User';
-    const headerVal = c.req.header(headerName)?.trim();
-    if (!headerVal) return { error: apiError(c, 401, failMessage) };
+    // 2. Trusted proxy identity (IAP JWT, else plaintext header).
+    const identity = await resolveProxyIdentity(c);
+    if (!identity) return { error: apiError(c, 401, failMessage) };
     try {
-      const user = await userDb.findOrCreateUserByPlatformIdentity('web', headerVal, headerVal);
+      const user = await userDb.findOrCreateUserByPlatformIdentity('web', identity, identity);
       return { userId: user.id, role: user.role };
     } catch (err) {
       getLog().error({ err: err as Error, headerPresent: true }, 'web.user_resolve_failed');

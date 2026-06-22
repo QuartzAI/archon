@@ -85,14 +85,49 @@ export function getSignupMode(
 }
 
 /**
- * Whether enabling web auth also gates the API server-side: every `/api/*`
- * request must resolve to an identity (except the public allowlist) or get 401.
- * On by default when web auth is enabled; `ARCHON_WEB_AUTH_REQUIRED=false` keeps
- * the login-UI-only posture (e.g. when a reverse proxy already gates access).
- * Always false when web auth is disabled (solo/local installs unaffected).
+ * Plaintext trusted-header auth is active when `ARCHON_WEB_AUTH_HEADER` is set.
+ * An upstream proxy (Caddy basicauth sidecar, or — weakly — IAP's
+ * `X-Goog-Authenticated-User-Email`) authenticates the user and injects their
+ * identity in a header which Archon trusts (see `resolveAuthContext`). Needs no
+ * Postgres and no signing secret.
+ *
+ * SECURITY: this header is only as strong as the network boundary — anyone who
+ * can reach the backend directly can forge it by knowing a teammate's email. Use
+ * `ARCHON_IAP_JWT_AUDIENCE` (`isIapJwtEnabled`) instead behind IAP for
+ * cryptographic verification that does NOT depend on the firewall. Only safe
+ * when Archon is reachable solely through the proxy (proxy strips inbound copies
+ * of the header, or the app binds 127.0.0.1 / is firewalled to the LB).
+ */
+export function isHeaderAuthEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return Boolean(env.ARCHON_WEB_AUTH_HEADER);
+}
+
+/**
+ * IAP JWT auth is active when `ARCHON_IAP_JWT_AUDIENCE` is set (the backend
+ * service id string, e.g. `/projects/<num>/global/backendServices/<id>`). In
+ * this mode Archon verifies the Google-signed `X-Goog-IAP-JWT-Assertion` against
+ * IAP's public keys and the configured audience (see `iap-jwt.ts`), and IGNORES
+ * the plaintext `ARCHON_WEB_AUTH_HEADER`. This is the strong posture: identity
+ * cannot be forged by a client that reaches the backend directly.
+ */
+export function isIapJwtEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return Boolean(env.ARCHON_IAP_JWT_AUDIENCE);
+}
+
+/**
+ * Whether the API is gated server-side: every `/api/*` request must resolve to
+ * an identity (except the public allowlist) or get 401. Active when ANY of
+ * Better Auth (`isWebAuthEnabled`), IAP JWT auth (`isIapJwtEnabled`), or
+ * plaintext header auth (`isHeaderAuthEnabled`) is configured.
+ * `ARCHON_WEB_AUTH_REQUIRED=false` opts out (login-UI-only / proxy-edge-only
+ * posture). Always false when none is configured — solo/local installs are
+ * unaffected.
  */
 export function isApiGateEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  return isWebAuthEnabled(env) && env.ARCHON_WEB_AUTH_REQUIRED !== 'false';
+  return (
+    (isWebAuthEnabled(env) || isIapJwtEnabled(env) || isHeaderAuthEnabled(env)) &&
+    env.ARCHON_WEB_AUTH_REQUIRED !== 'false'
+  );
 }
 
 /**
