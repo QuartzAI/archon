@@ -862,6 +862,14 @@ describe('GiteaAdapter', () => {
       );
       // @ts-expect-error - accessing private method for testing
       a.verifySignature = mock(() => true);
+      // Neutralize real network I/O: postComment / fetchCommentHistory hit the
+      // Gitea API via bare fetch with no timeout, so against the dummy base URL
+      // they hang until the 5s test timeout. Stub them so handleWebhook reaches
+      // handleMessage deterministically without touching the network.
+      // @ts-expect-error - accessing private method for testing
+      a.postComment = mock(async () => undefined);
+      // @ts-expect-error - accessing private method for testing
+      a.fetchCommentHistory = mock(async () => []);
       return a;
     }
 

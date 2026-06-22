@@ -447,7 +447,11 @@ describe('discoverAvailableCommands', () => {
   // --- Home-scoped commands (~/.archon/commands/) — new capability
   describe('home-scoped commands', () => {
     async function createHomeCommand(name: string, content = '# Home helper'): Promise<void> {
-      const dir = join(tmpHomeDir, 'commands');
+      // Write into the dir ARCHON_HOME points to during these tests. The inner
+      // beforeEach (above) overrides ARCHON_HOME to a fresh `emptyHome`, so the
+      // command must land there — not in the outer `tmpHomeDir`, which discovery
+      // no longer scans.
+      const dir = join(emptyHome, 'commands');
       await mkdir(dir, { recursive: true });
       await writeFile(join(dir, `${name}.md`), content);
     }
